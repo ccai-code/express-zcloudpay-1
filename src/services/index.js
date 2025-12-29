@@ -33,7 +33,7 @@ function planToAmountFen(plan) {
     const v = Number(process.env.TEST_PAY_FEN);
     if (Number.isFinite(v) && v > 0) return Math.floor(v);
   }
-  return plan === 'FORMAL' ? 10000 : 20000;
+  return plan === 'FORMAL' ? 100000 : 20000;
 }
 
 function planToCredits(plan) {
@@ -68,6 +68,9 @@ async function createUserWithRandomCredentials({ channelName }) {
   const userId = crypto.randomUUID();
   const passwordPlain = generateSixDigitPassword();
   const channel = (channelName || '').toString();
+  
+  // Use the new getPasswordHash function with rounds=12
+  const passwordHash = await getPasswordHash(String(passwordPlain));
 
   let seq = 1;
   try {
@@ -75,30 +78,59 @@ async function createUserWithRandomCredentials({ channelName }) {
     const c = Array.isArray(rows) && rows.length > 0 ? Number(rows[0].c || 0) : 0;
     seq = Number.isFinite(c) && c >= 0 ? c + 1 : 1;
   } catch {}
-  const username = `会员${seq}号`;
 
-  // Use the new getPasswordHash function with rounds=12
-  const passwordHash = await getPasswordHash(String(passwordPlain));
-  try {
-    await p.execute('INSERT INTO users (user_id, username, channel_name, password_plain, password) VALUES (?, ?, ?, ?, ?)', [
-      userId,
-      username,
-      channel,
-      passwordPlain,
-      passwordHash
-    ]);
-  } catch (err) {
-    const code = err && err.code ? String(err.code) : '';
-    if (code !== 'ER_BAD_FIELD_ERROR') throw err;
-    await p.execute('INSERT INTO users (user_id, username, channel_name, password_plain) VALUES (?, ?, ?, ?)', [
-      userId,
-      username,
-      channel,
-      passwordPlain
-    ]);
+  let attempt = 0;
+  const maxRetries = 20;
+
+  while (attempt < maxRetries) {
+    const username = `会员${seq}号`;
+    try {
+      await p.execute('INSERT INTO users (user_id, username, channel_name, password_plain, password) VALUES (?, ?, ?, ?, ?)', [
+        userId,
+        username,
+        channel,
+        passwordPlain,
+        passwordHash
+      ]);
+      // Success
+      return { user_id: userId, account: userId, username, password: passwordPlain };
+    } catch (err) {
+      const code = err && err.code ? String(err.code) : '';
+      const msg = err && err.message ? String(err.message) : '';
+
+      // Handle duplicate username
+      if (code === 'ER_DUP_ENTRY' && (msg.includes('username') || msg.includes('users.username'))) {
+        // Increment seq and retry
+        seq += crypto.randomInt(1, 10);
+        attempt++;
+        continue;
+      }
+
+      if (code !== 'ER_BAD_FIELD_ERROR') throw err;
+
+      // Fallback for old schema without 'password' column
+      try {
+        await p.execute('INSERT INTO users (user_id, username, channel_name, password_plain) VALUES (?, ?, ?, ?)', [
+          userId,
+          username,
+          channel,
+          passwordPlain
+        ]);
+        return { user_id: userId, account: userId, username, password: passwordPlain };
+      } catch (err2) {
+         const code2 = err2 && err2.code ? String(err2.code) : '';
+         const msg2 = err2 && err2.message ? String(err2.message) : '';
+         if (code2 === 'ER_DUP_ENTRY' && (msg2.includes('username') || msg2.includes('users.username'))) {
+            seq += crypto.randomInt(1, 10);
+            attempt++;
+            continue;
+         }
+         throw err2;
+      }
+    }
   }
 
-  return { user_id: userId, account: userId, username, password: passwordPlain };
+  throw new Error('Failed to create user: username conflict limit reached');
 }
 
 async function createPendingPayOrder({ outTradeNo, userId, channelName, amountFen, quotaAmount }) {
