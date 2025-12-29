@@ -1,6 +1,22 @@
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
-const { getPool } = require('./db');
+const { getPool } = require('../config/db');
+const userCrawlerQuotaModel = require('../models/userCrawlerQuota');
+const packageSubscriptionModel = require('../models/packageSubscription');
+
+/**
+ * 生成密码的哈希值。
+ * 注意：每次调用生成的哈希值都会不同，这是正常的，因为使用了随机盐。
+ * 使用 bcrypt 生成哈希，默认 rounds=12
+ */
+async function getPasswordHash(password) {
+  const salt = await bcrypt.genSalt(12);
+  return bcrypt.hash(password, salt);
+}
+
+async function checkPasswordHash(password, hashed) {
+  return bcrypt.compare(String(password), String(hashed));
+}
 
 function setUsersHasPasswordEnc(value) {
   void value;
@@ -17,7 +33,7 @@ function planToAmountFen(plan) {
     const v = Number(process.env.TEST_PAY_FEN);
     if (Number.isFinite(v) && v > 0) return Math.floor(v);
   }
-  return plan === 'FORMAL' ? 100000 : 20000;
+  return plan === 'FORMAL' ? 10000 : 20000;
 }
 
 function planToCredits(plan) {
@@ -61,7 +77,8 @@ async function createUserWithRandomCredentials({ channelName }) {
   } catch {}
   const username = `会员${seq}号`;
 
-  const passwordHash = await bcrypt.hash(String(passwordPlain), 10);
+  // Use the new getPasswordHash function with rounds=12
+  const passwordHash = await getPasswordHash(String(passwordPlain));
   try {
     await p.execute('INSERT INTO users (user_id, username, channel_name, password_plain, password) VALUES (?, ?, ?, ?, ?)', [
       userId,
@@ -100,25 +117,63 @@ async function getBalanceByUserId(conn, userId) {
   return r && r.balance !== null && r.balance !== undefined ? Number(r.balance || 0) : 0;
 }
 
-async function ensureQuotaRowAndAddRecharge(conn, userId, addQuota, quotaSource) {
-  const [rows] = await conn.execute(
-    'SELECT id, total_recharged FROM user_crawler_quota WHERE user_id = ? ORDER BY id DESC LIMIT 1 FOR UPDATE',
-    [String(userId)]
-  );
-  const now = Date.now();
-  if (!Array.isArray(rows) || rows.length === 0) {
-    await conn.execute(
-      'INSERT INTO user_crawler_quota (user_id, total_recharged, create_time, update_time, quota_source) VALUES (?, ?, ?, ?, ?)',
-      [String(userId), Number(addQuota || 0), now, now, Number(quotaSource || 0)]
-    );
-    return;
-  }
-  const current = Number(rows[0].total_recharged || 0);
-  await conn.execute('UPDATE user_crawler_quota SET total_recharged = ?, update_time = ? WHERE id = ? LIMIT 1', [
-    current + Number(addQuota || 0),
-    now,
-    rows[0].id
+async function getUserAuth(account) {
+  const p = await getPool();
+  const [rows] = await p.execute('SELECT user_id, password_plain, password FROM users WHERE user_id = ? LIMIT 1', [
+    String(account)
   ]);
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  return rows[0];
+}
+
+async function ensureUserPasswordHash(account) {
+  const p = await getPool();
+  const [rows] = await p.execute('SELECT user_id, password_plain, password FROM users WHERE user_id = ? LIMIT 1', [
+    String(account)
+  ]);
+  if (!Array.isArray(rows) || rows.length === 0) return false;
+  const r = rows[0];
+  const hasHash = r.password !== null && r.password !== undefined && String(r.password).startsWith('$2');
+  const plain = r.password_plain === null || r.password_plain === undefined ? '' : String(r.password_plain);
+  if (hasHash) return false;
+  if (!plain) return false;
+  const hash = await getPasswordHash(plain);
+  await p.execute('UPDATE users SET password = ? WHERE user_id = ? LIMIT 1', [hash, String(r.user_id)]);
+  return true;
+}
+
+async function verifyUserPassword({ account, password }) {
+  if (!account || !password) return false;
+  const p = await getPool();
+  let user = null;
+  try {
+    const [rows] = await p.execute('SELECT user_id, password_plain, password FROM users WHERE user_id = ? LIMIT 1', [
+      String(account)
+    ]);
+    if (Array.isArray(rows) && rows.length > 0) {
+      user = rows[0];
+    }
+  } catch {
+    user = null;
+  }
+  if (!user) return false;
+  const input = String(password);
+  const storedHash = user.password === null || user.password === undefined ? '' : String(user.password);
+  const storedPlain = user.password_plain === null || user.password_plain === undefined ? '' : String(user.password_plain);
+  if (storedHash) {
+    try {
+      const ok = await bcrypt.compare(input, storedHash);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+  return storedPlain && storedPlain === input;
+}
+
+async function ensureQuotaRowAndAddRecharge(conn, userId, addQuota, quotaSource) {
+  await userCrawlerQuotaModel.upsertTotalRecharged(conn, userId, addQuota, quotaSource);
+  await packageSubscriptionModel.ensureForRecharge(conn, userId, addQuota, {});
 }
 
 async function settlePayOrder({
@@ -573,6 +628,7 @@ async function syncAllUserCrawlerQuotaTotals() {
 
 module.exports = {
   setUsersHasPasswordEnc,
+  getPasswordHash,
   normalizePlan,
   planToAmountFen,
   planToCredits,
@@ -594,5 +650,8 @@ module.exports = {
   getLocalOrderRecord,
   getDealerOrders,
   getDealerAccounts,
-  getDealerAccountLogs
+  getDealerAccountLogs,
+  verifyUserPassword,
+  ensureUserPasswordHash,
+  checkPasswordHash
 };

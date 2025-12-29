@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const config = require('./wxpayConfig');
+const config = require('../config/wxpay');
 
 function generateSignature(method, urlPath, timestamp, nonce, body) {
   const message = `${method}\n${urlPath}\n${timestamp}\n${nonce}\n${body}\n`;
